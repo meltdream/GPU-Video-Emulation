@@ -1,0 +1,504 @@
+// FM - frequency modulator, GPU version
+// port of Tomasz Sulej fm sketch (GenerateMe), licence: http://unlicense.org/
+
+// every line of the image is treated as a signal:
+// - convert RGB into colorspace (GS - grayscale)
+// for every channel
+// - modulate signal
+// - quantize and dequantize (if quantval > 0)
+// - demodulate using derivative
+// - 3 lowpass filters in a chain to remove carrier
+// combine channels and back to RGB
+
+// one thread = one line, all 3 channels at once (they don't talk to each other anyway)
+// dispatch (height+63)/64 x 1 x 1
+
+#version 430
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+
+uniform int colorspace = 1; // see consts below, RGB = 1
+uniform bool firstChannelOnly = false; // for L.. or Y.. colorspaces set true to modulate only luma
+uniform int quantval = 30; // 0 - off, less - more glitch, more - more precision
+uniform bool lowpass1On = true; // on/off of filters
+uniform bool lowpass2On = true;
+uniform bool lowpass3On = true;
+// better don't touch it, lowpass filters are run in cascade
+uniform float lowpass1Cutoff = 0.25; // percentage of rate
+uniform float lowpass2Cutoff = 0.1;
+uniform float lowpass3Cutoff = 0.05;
+uniform float carrier = 0.5; // was mouse X, 0..1, carrier wave frequency
+uniform float bandwidth = 0.5; // was mouse Y, 0..1
+uniform bool negate = false; // N key
+
+const int OHTA = 0, RGB = 1, CMY = 2, HSB = 3, XYZ = 4, YXY = 5, HCL = 6, LUV = 7;
+const int LAB = 8, HWB = 9, RGGBG = 10, YPbPr = 11, YCbCr = 12, YDbDr = 13, GS = 14, YUV = 15;
+
+const float TAU = 6.28318531;
+
+// colorspace stuff
+const float UMAX = 0.436 * 255.0;
+const float VMAX = 0.615 * 255.0;
+const float D65X = 0.950456, D65Y = 1.0, D65Z = 1.088754;
+const float CIE_EPS = 216.0 / 24389.0;
+const float CIE_K = 24389.0 / 27.0;
+const float D65FX_4 = 4.0 * D65X / (D65X + 15.0 * D65Y + 3.0 * D65Z);
+const float D65FY_9 = 9.0 * D65Y / (D65X + 15.0 * D65Y + 3.0 * D65Z);
+const float RANGE_X = 100.0 * (0.4124 + 0.3576 + 0.1805);
+const float RANGE_Y = 100.0;
+const float RANGE_Z = 100.0 * (0.0193 + 0.1192 + 0.9505);
+
+float map(float v, float a, float b, float c, float d) { return c + (d - c) * (v - a) / (b - a); }
+vec3 map(vec3 v, float a, float b, float c, float d) { return c + (d - c) * (v - a) / (b - a); }
+
+float n255(int v) { return float(v) / 255.0; }
+int round255(float v) { return int(floor(v * 255.0 + 0.5)); } // java round() of v*255
+
+// clamp like blendRGB
+ivec3 blend(ivec3 c) { return clamp(c, 0, 255); }
+ivec3 blend(vec3 c) { return clamp(ivec3(c * 255.0), 0, 255); }
+
+int min3(ivec3 c) { return min(c.r, min(c.g, c.b)); }
+int max3(ivec3 c) { return max(c.r, max(c.g, c.b)); }
+
+int luma(ivec3 c)  { return clamp(int(0.2126 * float(c.r) + 0.7152 * float(c.g) + 0.0722 * float(c.b)), 0, 255); }
+
+/**************
+ * YUV
+ **************/
+
+ivec3 toYUV(ivec3 c) {
+  vec3 f = vec3(c);
+  int y = int(0.299 * f.r + 0.587 * f.g + 0.114 * f.b);
+  int u = int(map(-0.14713 * f.r - 0.28886 * f.g + 0.436 * f.b, -UMAX, UMAX, 0.0, 255.0));
+  int v = int(map(0.615 * f.r - 0.51499 * f.g - 0.10001 * f.b, -VMAX, VMAX, 0.0, 255.0));
+  return blend(ivec3(y, u, v));
+}
+
+ivec3 fromYUV(ivec3 c) {
+  float y = float(c.r);
+  float u = map(float(c.g), 0.0, 255.0, -UMAX, UMAX);
+  float v = map(float(c.b), 0.0, 255.0, -VMAX, VMAX);
+  return blend(ivec3(int(y + 1.13983 * v), int(y - 0.39465 * u - 0.58060 * v), int(y + 2.03211 * u)));
+}
+
+/**************
+ * YDbDr
+ **************/
+
+ivec3 toYDbDr(ivec3 c) {
+  vec3 f = vec3(c);
+  int y = int(0.299 * f.r + 0.587 * f.g + 0.114 * f.b);
+  int db = int(127.5 + (-0.450 * f.r - 0.883 * f.g + 1.333 * f.b) / 2.666);
+  int dr = int(127.5 + (-1.333 * f.r + 1.116 * f.g + 0.217 * f.b) / 2.666);
+  return blend(ivec3(y, db, dr));
+}
+
+ivec3 fromYDbDr(ivec3 c) {
+  float y = float(c.r);
+  float db = (float(c.g) - 127.5) * 2.666;
+  float dr = (float(c.b) - 127.5) * 2.666;
+  return blend(ivec3(
+    int(y + 9.2303716147657e-05 * db - 0.52591263066186533 * dr),
+    int(y - 0.12913289889050927 * db + 0.26789932820759876 * dr),
+    int(y + 0.66467905997895482 * db - 7.9202543533108e-05 * dr)));
+}
+
+/**************
+ * YCbCr
+ **************/
+
+ivec3 toYCbCr(ivec3 c) {
+  vec3 f = vec3(c);
+  int y = int(0.2988390 * f.r + 0.5868110 * f.g + 0.1143500 * f.b);
+  int cb = int(-0.168736 * f.r - 0.3312640 * f.g + 0.5000000 * f.b + 127.5);
+  int cr = int(0.5000000 * f.r - 0.4186880 * f.g - 0.0813120 * f.b + 127.5);
+  return blend(ivec3(y, cb, cr));
+}
+
+ivec3 fromYCbCr(ivec3 c) {
+  float y = float(c.r), cb = float(c.g) - 127.5, cr = float(c.b) - 127.5;
+  return blend(ivec3(int(y + 1.402 * cr) + 1, int(y - 0.344136 * cb - 0.714136 * cr), int(y + 1.772 * cb) + 1)); // +1 some fix, from original
+}
+
+/**************
+ * YPbPr
+ **************/
+
+ivec3 toYPbPr(ivec3 c) {
+  int y = luma(c);
+  int pb = c.b - y, pr = c.r - y;
+  if (pb < 0) pb += 256;
+  if (pr < 0) pr += 256;
+  return blend(ivec3(y, pb, pr));
+}
+
+ivec3 fromYPbPr(ivec3 c) {
+  int y = c.r;
+  int b = c.g + y, r = c.b + y;
+  if (r > 255) r -= 256;
+  if (b > 255) b -= 256;
+  int g = int((float(y) - 0.2126 * float(r) - 0.0722 * float(b)) / 0.7152);
+  return blend(ivec3(r, g, b));
+}
+
+/**************
+ * R-G,G,B-G
+ **************/
+
+ivec3 toRGGBG(ivec3 c) {
+  int r = c.r - c.g, b = c.b - c.g;
+  if (r < 0) r += 256;
+  if (b < 0) b += 256;
+  return blend(ivec3(r, c.g, b));
+}
+
+ivec3 fromRGGBG(ivec3 c) {
+  int r = c.r + c.g, b = c.b + c.g;
+  if (r > 255) r -= 256;
+  if (b > 255) b -= 256;
+  return blend(ivec3(r, c.g, b));
+}
+
+/**************
+ * HSB
+ **************/
+
+ivec3 toHSB(ivec3 c) {
+  int lo = min3(c), hi = max3(c);
+  float delta = float(hi - lo);
+  if (delta == 0.0) return blend(vec3(0.0, 0.0, n255(hi))); // java gets NaN here for black, ends as 0 anyway
+  float h;
+  if (c.r == hi) h = float(c.g - c.b) / delta;
+  else if (c.g == hi) h = 2.0 + float(c.b - c.r) / delta;
+  else h = 4.0 + float(c.r - c.g) / delta;
+  h /= 6.0;
+  if (h < 0.0) h += 1.0;
+  return blend(vec3(h, delta / float(hi), n255(hi)));
+}
+
+ivec3 fromHSB(ivec3 c) {
+  float s = n255(c.g), v = n255(c.b);
+  if (s == 0.0) return blend(vec3(v));
+  float h = 6.0 * n255(c.r);
+  float f = h - floor(h);
+  float p = v * (1.0 - s), q = v * (1.0 - s * f), t = v * (1.0 - s * (1.0 - f));
+  switch (int(h)) {
+    case 1: return blend(vec3(q, v, p));
+    case 2: return blend(vec3(p, v, t));
+    case 3: return blend(vec3(p, q, v));
+    case 4: return blend(vec3(t, p, v));
+    case 5: return blend(vec3(v, p, q));
+    default: return blend(vec3(v, t, p));
+  }
+}
+
+/**************
+ * HWB
+ **************/
+
+ivec3 toHWB(ivec3 c) {
+  int w = min3(c), v = max3(c);
+  int hue = 255;
+  if (v != w) {
+    float f = float(c.r == w ? c.g - c.b : (c.g == w ? c.b - c.r : c.r - c.g));
+    float p = c.r == w ? 3.0 : (c.g == w ? 5.0 : 1.0);
+    hue = int(map((p - f / float(v - w)) / 6.0, 0.0, 1.0, 0.0, 254.0));
+  }
+  return blend(ivec3(hue, w, 255 - v));
+}
+
+ivec3 fromHWB(ivec3 c) {
+  int b = 255 - c.b;
+  if (c.r == 255) return blend(ivec3(b));
+  float hue = map(float(c.r), 0.0, 254.0, 0.0, 6.0);
+  float v = n255(b), w = n255(c.g);
+  int i = int(floor(hue));
+  float f = hue - float(i);
+  if ((i & 1) != 0) f = 1.0 - f;
+  float n = w + f * (v - w);
+  switch (i) {
+    case 1: return blend(vec3(n, v, w));
+    case 2: return blend(vec3(w, v, n));
+    case 3: return blend(vec3(w, n, v));
+    case 4: return blend(vec3(n, w, v));
+    case 5: return blend(vec3(v, w, n));
+    default: return blend(vec3(v, n, w));
+  }
+}
+
+/**************
+ * XYZ
+ **************/
+
+// FIXME: range from 0 to 1
+float linear(float n) { return (n > 0.04045 ? pow((n + 0.055) / 1.055, 2.4) : n / 12.92) * 100.0; }
+float gamma(float n) { return n > 0.0031308 ? 1.055 * pow(n, 1.0 / 2.4) - 0.055 : 12.92 * n; }
+
+vec3 rgb2xyz(ivec3 c) {
+  float r = linear(n255(c.r)), g = linear(n255(c.g)), b = linear(n255(c.b));
+  return vec3(r * 0.4124 + g * 0.3576 + b * 0.1805,
+              r * 0.2126 + g * 0.7152 + b * 0.0722,
+              r * 0.0193 + g * 0.1192 + b * 0.9505);
+}
+
+ivec3 xyz2rgb(vec3 xyz) {
+  vec3 p = xyz / 100.0;
+  return blend(ivec3(
+    round255(gamma(p.x * 3.2406 + p.y * -1.5372 + p.z * -0.4986)),
+    round255(gamma(p.x * -0.9689 + p.y * 1.8758 + p.z * 0.0415)),
+    round255(gamma(p.x * 0.0557 + p.y * -0.2040 + p.z * 1.0570))));
+}
+
+ivec3 toXYZ(ivec3 c) {
+  vec3 xyz = rgb2xyz(c);
+  return blend(ivec3(int(map(xyz.x, 0.0, RANGE_X, 0.0, 255.0)), int(map(xyz.y, 0.0, RANGE_Y, 0.0, 255.0)), int(map(xyz.z, 0.0, RANGE_Z, 0.0, 255.0))));
+}
+
+ivec3 fromXYZ(ivec3 c) {
+  return xyz2rgb(vec3(map(float(c.r), 0.0, 255.0, 0.0, RANGE_X), map(float(c.g), 0.0, 255.0, 0.0, RANGE_Y), map(float(c.b), 0.0, 255.0, 0.0, RANGE_Z)));
+}
+
+/**************
+ * Yxy
+ **************/
+
+ivec3 toYXY(ivec3 c) {
+  vec3 xyz = rgb2xyz(c);
+  float sum = xyz.x + xyz.y + xyz.z;
+  float x = xyz.x > 0.0 ? xyz.x / sum : 0.0;
+  float y = xyz.y > 0.0 ? xyz.y / sum : 0.0;
+  return blend(ivec3(int(map(xyz.y, 0.0, RANGE_Y, 0.0, 255.0)), int(x * 255.0), int(y * 255.0)));
+}
+
+ivec3 fromYXY(ivec3 c) {
+  float Y = map(float(c.r), 0.0, 255.0, 0.0, RANGE_Y);
+  float x = n255(c.g), y = n255(c.b);
+  float divy = Y / (y > 0.0 ? y : 1.0e-6);
+  return xyz2rgb(vec3(x * divy, Y, (1.0 - x - y) * divy));
+}
+
+/**************
+ * Lab
+ **************/
+
+float labf(float t) { return t > CIE_EPS ? pow(t, 1.0 / 3.0) : (CIE_K * t + 16.0) / 116.0; }
+
+ivec3 toLAB(ivec3 c) {
+  vec3 xyz = rgb2xyz(c) / 100.0 / vec3(D65X, D65Y, D65Z);
+  float x = labf(xyz.x), y = labf(xyz.y), z = labf(xyz.z);
+  float L = (116.0 * y - 16.0) * 0.01;
+  return blend(ivec3(round255(L), round255(0.5 * (x - y) + 0.5), round255(0.5 * (y - z) + 0.5)));
+}
+
+ivec3 fromLAB(ivec3 c) {
+  float L = 100.0 * n255(c.r);
+  float y = (L + 16.0) / 116.0;
+  float x = y + n255(c.g) - 0.5; // not *2, so lab looses saturation on the way back. same in original, left it
+  float z = y - (n255(c.b) - 0.5);
+  x = x * x * x > CIE_EPS ? x * x * x : (116.0 * x - 16.0) / CIE_K;
+  y = y * y * y > CIE_EPS ? y * y * y : L / CIE_K;
+  z = z * z * z > CIE_EPS ? z * z * z : (116.0 * z - 16.0) / CIE_K;
+  return xyz2rgb(vec3(RANGE_X * x, RANGE_Y * y, RANGE_Z * z));
+}
+
+/**************
+ * Luv
+ **************/
+
+float reciprocal(float x) {
+  float sgn = x < 0.0 ? -1.0 : 1.0;
+  return sgn * x >= 1.0e-10 ? 1.0 / x : sgn / 1.0e-10;
+}
+
+ivec3 toLUV(ivec3 c) {
+  vec3 xyz = rgb2xyz(c) / 100.0;
+  float L = xyz.y > CIE_EPS ? 116.0 * pow(xyz.y, 1.0 / 3.0) - 16.0 : CIE_K * xyz.y;
+  float a = reciprocal(xyz.x + 15.0 * xyz.y + 3.0 * xyz.z);
+  float u = 13.0 * L * (4.0 * a * xyz.x - D65FX_4);
+  float v = 13.0 * L * (9.0 * a * xyz.y - D65FY_9);
+  return blend(ivec3(round255(L / 100.0), round255((u + 134.0) / 354.0), round255((v + 140.0) / 262.0)));
+}
+
+ivec3 fromLUV(ivec3 c) {
+  float L = 100.0 * n255(c.r);
+  if (L == 0.0) return ivec3(0); // 0/0 below, java ends with black
+  float u = 354.0 * n255(c.g) - 134.0;
+  float v = 262.0 * n255(c.b) - 140.0;
+  float Y = L > CIE_K * CIE_EPS ? pow((L + 16.0) / 116.0, 3.0) : L / CIE_K;
+  float l13 = 13.0 * L;
+  float l13u = 52.0 * L / (u + l13 * D65FX_4);
+  float X = (Y * (39.0 * L / (v + l13 * D65FY_9) - 5.0) + 5.0 * Y) / ((l13u - 1.0) / 3.0 + 1.0 / 3.0);
+  float Z = X * ((l13u - 1.0) / 3.0) - 5.0 * Y;
+  return xyz2rgb(100.0 * vec3(X, Y, Z));
+}
+
+/**************
+ * HCL
+ **************/
+
+ivec3 toHCL(ivec3 c) {
+  float r = n255(c.r), g = n255(c.g), b = n255(c.b);
+  float hi = max(r, max(g, b));
+  float chr = hi - min(r, min(g, b));
+  float h = 0.0;
+  if (chr != 0.0) {
+    if (r == hi) h = mod((g - b) / chr + 6.0, 6.0);
+    else if (g == hi) h = (b - r) / chr + 2.0;
+    else h = (r - g) / chr + 4.0;
+  }
+  return blend(ivec3(round255(h / 6.0), round255(chr), round255(0.298839 * r + 0.586811 * g + 0.114350 * b)));
+}
+
+ivec3 fromHCL(ivec3 c) {
+  float h = 6.0 * n255(c.r), chr = n255(c.g), l = n255(c.b);
+  float x = chr * (1.0 - abs(mod(h, 2.0) - 1.0));
+  vec3 rgb;
+  if (h < 1.0) rgb = vec3(chr, x, 0.0);
+  else if (h < 2.0) rgb = vec3(x, chr, 0.0);
+  else if (h < 3.0) rgb = vec3(0.0, chr, x);
+  else if (h < 4.0) rgb = vec3(0.0, x, chr);
+  else if (h < 5.0) rgb = vec3(x, 0.0, chr);
+  else rgb = vec3(chr, 0.0, x);
+  rgb += l - dot(rgb, vec3(0.298839, 0.586811, 0.114350));
+  return blend(ivec3(round255(rgb.r), round255(rgb.g), round255(rgb.b)));
+}
+
+/**************
+ * OHTA
+ **************/
+
+ivec3 toOHTA(ivec3 c) {
+  vec3 f = vec3(c);
+  int i1 = int(0.33333 * f.r + 0.33334 * f.g + 0.33333 * f.b);
+  int i2 = int(map(0.5 * (f.r - f.b), -127.5, 127.5, 0.0, 255.0));
+  int i3 = int(map(-0.25 * f.r + 0.5 * f.g - 0.25 * f.b, -127.5, 127.5, 0.0, 255.0));
+  return blend(ivec3(i1, i2, i3));
+}
+
+ivec3 fromOHTA(ivec3 c) {
+  float i1 = float(c.r);
+  float i2 = map(float(c.g), 0.0, 255.0, -127.5, 127.5);
+  float i3 = map(float(c.b), 0.0, 255.0, -127.5, 127.5);
+  return blend(ivec3(int(i1 + i2 - 0.66668 * i3), int(i1 + 1.33333 * i3), int(i1 - i2 - 0.66668 * i3)));
+}
+
+// colorspace converters
+ivec3 toColorspace(ivec3 c, int cs) {
+  switch (cs) {
+    case OHTA: return toOHTA(c);
+    case CMY: return 255 - c;
+    case HSB: return toHSB(c);
+    case XYZ: return toXYZ(c);
+    case YXY: return toYXY(c);
+    case HCL: return toHCL(c);
+    case LUV: return toLUV(c);
+    case LAB: return toLAB(c);
+    case HWB: return toHWB(c);
+    case RGGBG: return toRGGBG(c);
+    case YPbPr: return toYPbPr(c);
+    case YCbCr: return toYCbCr(c);
+    case YDbDr: return toYDbDr(c);
+    case GS: return ivec3(luma(c));
+    case YUV: return toYUV(c);
+    default: return c;
+  }
+}
+
+ivec3 fromColorspace(ivec3 c, int cs) {
+  switch (cs) {
+    case OHTA: return fromOHTA(c);
+    case CMY: return 255 - c;
+    case HSB: return fromHSB(c);
+    case XYZ: return fromXYZ(c);
+    case YXY: return fromYXY(c);
+    case HCL: return fromHCL(c);
+    case LUV: return fromLUV(c);
+    case LAB: return fromLAB(c);
+    case HWB: return fromHWB(c);
+    case RGGBG: return fromRGGBG(c);
+    case YPbPr: return fromYPbPr(c);
+    case YCbCr: return fromYCbCr(c);
+    case YDbDr: return fromYDbDr(c);
+    case GS: return ivec3(luma(c));
+    case YUV: return fromYUV(c);
+    default: return c;
+  }
+}
+
+ivec3 pixel(int x, int y) {
+  ivec3 c = ivec3(texelFetch(src, ivec2(x, y), 0).rgb * 255.0 + 0.5);
+  return toColorspace(c, colorspace);
+}
+
+// lowpass filter, prev is kept by caller
+float alpha(float rate, float hz) {
+  float dt = 1.0 / rate, tau = 1.0 / (hz * TAU);
+  return dt / (tau + dt);
+}
+
+vec3 low(inout vec3 prev, vec3 s, float a) {
+  prev = s * a + (prev - prev * a);
+  return prev;
+}
+
+void main() {
+  ivec2 size = textureSize(src, 0);
+  int w = size.x, y = int(gl_GlobalInvocationID.x);
+  if (y >= size.y) return;
+
+  // was in setup()
+  float minOmega = TAU / (0.05 * float(w)), maxOmega = TAU / (300.0 * float(w));
+  // was in draw(), from mouse
+  float omega = map(sqrt(carrier), 0.0, 1.0, minOmega, maxOmega);
+  float maxPhase = map(bandwidth * bandwidth, 0.0, 1.0, 0.05, 50.0) * omega;
+  float minPhase = -maxPhase;
+
+  float rate = 100000.0;
+  float a1 = alpha(rate, lowpass1Cutoff * rate);
+  float a2 = alpha(rate, lowpass2Cutoff * rate);
+  float a3 = alpha(rate, lowpass3Cutoff * rate);
+
+  //reset filters each line
+  vec3 lp1 = map(vec3(pixel(0, y)), 0.0, 255.0, minPhase, maxPhase), lp2 = lp1, lp3 = lp1;
+  vec3 integral = vec3(0.0); // integral of the signal
+  vec3 last = vec3(0.0); // previous value of modulated signal
+
+  for (int x = 0; x < w; x++) {
+    /////////////////////////
+    // FM part starts here
+    /////////////////////////
+
+    ivec3 c = pixel(x, y);
+    // wrapped to 2pi, gpu cos() goes bad with big numbers
+    integral = mod(integral + map(vec3(c), 0.0, 255.0, minPhase, maxPhase), TAU);
+    vec3 m = cos(mod(omega * float(x), TAU) + integral); // modulate signal
+
+    if (quantval > 0) {
+      float q = float(quantval);
+      m = map(vec3(ivec3(map(m, -1.0, 1.0, 0.0, q))), 0.0, q, -1.0, 1.0); // quantize
+    }
+
+    vec3 dem = abs(m - last); // demodulate signal, derivative
+    last = m;
+
+    // lowpass filter chain
+    if (lowpass1On) dem = low(lp1, dem, a1);
+    if (lowpass2On) dem = low(lp2, dem, a2);
+    if (lowpass3On) dem = low(lp3, dem, a3);
+
+    // remap signal back to channel value
+    ivec3 v = clamp(ivec3(map(2.0 * (dem - omega), minPhase, maxPhase, 0.0, 255.0)), 0, 255);
+    if (negate) v = 255 - v;
+    if (firstChannelOnly) v.yz = c.yz;
+
+    //////////////////////
+    // FM part ends here
+    //////////////////////
+
+    imageStore(dst, ivec2(x, y), vec4(vec3(fromColorspace(v, colorspace)) / 255.0, 1.0));
+  }
+}

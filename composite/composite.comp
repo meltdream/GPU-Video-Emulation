@@ -1,0 +1,489 @@
+// Composite Video Simulator, GPU version
+// port of Tomasz Sulej composite_video_simulator sketch (GenerateMe), licence: http://unlicense.org/
+// which is port of Jonathan Campbell code: https://github.com/joncampbell123/composite-video-simulator
+
+// Explanation of the process. Image (line by line) is treated as a signal, which goes following path:
+// 1. Convert to YIQ. Y is luma (brightness), I and Q are chroma and encode color
+// 2. Lowpass filter on chroma
+// 3. QAM to pack all three channels into one signal (composite video)
+// 4. Amplify high frequencies of the signal
+// 5. Add noise to the signal
+// 6. Demodulate to get luma and chroma back
+// 7. Simulate tape by applying FM on luma (and add noise)
+// 8. Add chroma noise
+// 9. Add noise to hue (rotate I and Q)
+// 10. Luma low pass filter + slightly amplify higher freqs
+// 11. Chroma low pass with delay
+// 12. Blur chroma vertically
+// 13. Sharpen luma
+// 14. Modulate and demodulate (QAM) - just another device to device connection
+// 15. More device-to-device connections
+// 16. Lowpass filter on chroma once more
+// 17. Back to RGB
+// 18. RGB TV scanlines
+// 19. done...
+
+// how to run:
+// stage 0 - one thread = one line, dispatch (height+63)/64 x 1 x 1
+// memory barrier
+// stage 1 - scanlines, dispatch (width+63)/64 x height x 1 (skip if scanlinesScale <= 1)
+// work buffer = width * height * 9 ints
+
+#version 430
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+layout(std430, binding = 2) buffer Work { int work[]; };
+
+uniform int stage; // 0 - signal, 1 - scanlines
+uniform int seed; // change every frame for moving noise
+
+///// CONFIG START
+
+uniform bool inChromaLowpass = true; // low pass filter on input chroma values
+uniform int subcarrierAmp = 40; // values: 1-200
+uniform int subcarrierAmpBack = 40; // values similar to subcarrierAmp
+uniform int phaseShift = 0; // 0,90,180,270
+uniform int phaseShiftOffset = 0; // 0, 90, 180, 270
+uniform float preemphasis = 1.0; // signal amplification: 1-100
+uniform float preemphasisCut = 3579545.5; // filter cutoff, 315000000 / 88
+uniform int videoNoise = 4000; // luma noise
+uniform int chromaNoise = 4000; // chroma noise
+uniform int chromaPhaseNoise = 15; // hue noise
+uniform bool outChromaLowpass = true; // filter output
+uniform bool outChromaLowpassLite = false; // true = lite filter, false = strong filter
+uniform float chromaLoss = 0.24; // loss of color probability
+uniform bool svideoOut = true; // false = composite out, one more encode/decode
+uniform int vhsMode = 1; // 0 - none, 1 - SP, 2 - LP, 3 - EP
+uniform bool chromaVertBlend = true; // blend colors
+uniform bool vhsSharpen = true; // sharpen image
+uniform float sharpenAmount = 2.0; // sharpen amount
+uniform int recombine = 0; // number of device-to-device connections
+uniform float scanlinesScale = 1.5; // 0 - no scanlines, >1 blur
+uniform bool fm = true; // add FM (tape) errors, needs vhsMode > 0
+uniform float fmOmega = 0.62; // carrier - experiment 0.001 - 40
+uniform float fmPhase = 2.0; // bandwidth - experiment 0.001 - 40
+uniform float fmLightness = 0.62; // adjust lightness when FM
+uniform int fmQuantize = 0; // quantize FM signal, 0 - off, 2 - dramatic, 20 - better, 100 - best
+uniform bool fmNoise = true; // and tape error noise
+uniform float fmNoiseStart = 0.92; // error start - percentage of the image
+uniform float fmNoiseStop = 1.0; // error stop - % of image (0 - top, 1 - bottom)
+
+///// END
+
+const float RATE = 315000000.0 * 4.0 / 88.0; // 4x subcarrier, every pixel is one sample
+const float PI = 3.14159265;
+const float TAU = 6.28318531;
+const int umult[4] = int[](1, 0, -1, 0);
+const int vmult[4] = int[](0, 1, 0, -1);
+const int Y = 0, I = 1, Q = 2, T = 3; // T - temp for chroma
+
+int W, H, row, slot; // slot 0 - line above (for vertical blend), 1 - current line
+
+// work buffer: every thread has its own 2 lines x 4 channels, rgb result at the end
+int ix(int ch, int x) { return ((row * 2 + slot) * 4 + ch) * W + x; }
+int px(int x, int y) { return W * H * 8 + y * W + x; }
+
+// random() replacement, same x,y gives same number in every thread
+uint hash(uint x) {
+  x ^= x >> 16; x *= 0x7feb352du;
+  x ^= x >> 15; x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+uint rnd(int x, int y, int tag) { return hash(uint(x) ^ hash(uint(y) ^ hash(uint(tag) ^ hash(uint(seed))))); }
+float frand(int x, int y, int tag) { return float(rnd(x, y, tag) >> 8) / 16777216.0; }
+int irand(int x, int y, int tag, int m) { return int((rnd(x, y, tag) >> 1) % uint(m)); }
+
+float map(float v, float a, float b, float c, float d) { return c + (d - c) * (v - a) / (b - a); }
+
+// processing noise() kind of, 4 octaves
+float lattice(int i, int j) { return float(rnd(i, j, 99) >> 8) / 16777216.0; }
+float ease(float t) { return 0.5 * (1.0 - cos(t * PI)); }
+
+float pnoise(float x, float y) {
+  float r = 0.0, amp = 0.5;
+  for (int o = 0; o < 4; o++) {
+    ivec2 k = ivec2(floor(vec2(x, y)));
+    vec2 f = vec2(x, y) - vec2(k);
+    float a = mix(lattice(k.x, k.y), lattice(k.x + 1, k.y), ease(f.x));
+    float b = mix(lattice(k.x, k.y + 1), lattice(k.x + 1, k.y + 1), ease(f.x));
+    r += amp * mix(a, b, ease(f.y));
+    amp *= 0.5; x *= 2.0; y *= 2.0;
+  }
+  return r;
+}
+
+/**************
+ * Lowpass filter
+ **************/
+
+struct Lp { float alpha; float prev; };
+
+Lp lowpass(float rate, float hz, float start) {
+  float dt = 1.0 / rate, tau = 1.0 / (hz * TAU);
+  return Lp(dt / (tau + dt), start);
+}
+
+float low(inout Lp f, float s) {
+  f.prev = s * f.alpha + (f.prev - f.prev * f.alpha);
+  return f.prev;
+}
+
+float high(inout Lp f, float s) { return s - low(f, s); }
+
+// luma cut, chroma cut, chroma delay
+ivec3 vhsParams() {
+  if (vhsMode == 2) return ivec3(1900000, 300000, 12);
+  if (vhsMode == 3) return ivec3(1400000, 280000, 14);
+  return ivec3(2400000, 320000, 9);
+}
+
+/**************
+ * QAM
+ **************/
+
+int phaseAt(int y) {
+  if (phaseShift == 90) return (phaseShiftOffset + (y >> 1)) & 3;
+  if (phaseShift == 180) return ((y & 2) + phaseShiftOffset) & 3;
+  if (phaseShift == 270) return (phaseShiftOffset - (y >> 1)) & 3;
+  return phaseShiftOffset & 3;
+}
+
+// chroma into luma (modulate)
+void intoLuma(int y) {
+  int xi = phaseAt(y);
+  for (int x = 0; x < W; x++) {
+    int s = (x + xi) & 3;
+    int c = work[ix(I, x)] * subcarrierAmp * umult[s] + work[ix(Q, x)] * subcarrierAmp * vmult[s];
+    work[ix(Y, x)] += c / 50;
+    work[ix(I, x)] = 0;
+    work[ix(Q, x)] = 0;
+  }
+}
+
+// chroma from luma (demodulate)
+void fromLuma(int y) {
+  int d0 = 0, d1 = 0, d2 = work[ix(Y, 0)], d3 = work[ix(Y, 1)];
+  int sum = d2 + d3;
+  for (int x = 0; x < W; x++) {
+    int c = x + 2 < W ? work[ix(Y, x + 2)] : 0;
+    sum -= d0;
+    d0 = d1; d1 = d2; d2 = d3; d3 = c;
+    sum += c;
+    work[ix(Y, x)] = sum >> 2;
+    work[ix(T, x)] = c - (sum >> 2);
+  }
+
+  int xi = phaseAt(y);
+  for (int x = (4 - xi) & 3; x + 3 < W; x += 4) {
+    work[ix(T, x + 2)] = -work[ix(T, x + 2)];
+    work[ix(T, x + 3)] = -work[ix(T, x + 3)];
+  }
+  for (int x = 0; x < W; x++) work[ix(T, x)] = work[ix(T, x)] * 50 / subcarrierAmpBack;
+
+  int x = 0;
+  for (; x + xi + 1 < W; x += 2) {
+    work[ix(I, x)] = -work[ix(T, x + xi)];
+    work[ix(Q, x)] = -work[ix(T, x + xi + 1)];
+  }
+  for (; x < W; x += 2) {
+    work[ix(I, x)] = 0;
+    work[ix(Q, x)] = 0;
+  }
+
+  for (x = 0; x + 2 < W; x += 2) {
+    work[ix(I, x + 1)] = (work[ix(I, x)] + work[ix(I, x + 2)]) >> 1;
+    work[ix(Q, x + 1)] = (work[ix(Q, x)] + work[ix(Q, x + 2)]) >> 1;
+  }
+  for (; x < W; x++) {
+    work[ix(I, x)] = 0;
+    work[ix(Q, x)] = 0;
+  }
+}
+
+/**************
+ * Chroma lowpass
+ **************/
+
+void chromaLowpass(int ch, float hz, int delay) {
+  Lp a = lowpass(RATE, hz, 0.0), b = a, c = a;
+  for (int x = 0; x < W; x++) {
+    float s = low(c, low(b, low(a, float(work[ix(ch, x)]))));
+    if (x >= delay) work[ix(ch, x - delay)] = int(s);
+  }
+}
+
+void compositeLowpass() {
+  chromaLowpass(1, 1300000.0, 2);
+  chromaLowpass(2, 600000.0, 4);
+}
+
+void compositeLowpassTv() {
+  chromaLowpass(1, 2600000.0, 1);
+  chromaLowpass(2, 2600000.0, 1);
+}
+
+/**************
+ * Signal path
+ **************/
+
+// everything before vertical blend, done also for line above
+void signalPath(int y) {
+  for (int x = 0; x < W; x++) {
+    // to YIQ
+    vec3 c = vec3(ivec3(texelFetch(src, ivec2(x, y), 0).rgb * 255.0 + 0.5));
+    float l = 0.3 * c.r + 0.59 * c.g + 0.11 * c.b;
+    work[ix(Y, x)] = int(256.0 * l);
+    work[ix(I, x)] = int(256.0 * (-0.27 * (c.b - l) + 0.74 * (c.r - l)));
+    work[ix(Q, x)] = int(256.0 * (0.41 * (c.b - l) + 0.48 * (c.r - l)));
+  }
+
+  // composite chroma lowpass
+  if (inChromaLowpass) compositeLowpass();
+
+  intoLuma(y); // chroma to luma
+
+  // preemphasis
+  if (preemphasis != 0.0 && preemphasisCut > 0.0) {
+    Lp pre = lowpass(RATE, preemphasisCut, 16.0);
+    for (int x = 0; x < W; x++) {
+      float s = float(work[ix(Y, x)]);
+      s += high(pre, s) * preemphasis;
+      work[ix(Y, x)] = int(s);
+    }
+  }
+
+  // video noise
+  if (videoNoise != 0) {
+    int m = videoNoise * 2 + 1, n = 0;
+    for (int k = 32; k > 0; k--) n = (n + irand(W - k, y - 1, 1, m) - videoNoise) >> 1; // warm up from end of the line above
+    for (int x = 0; x < W; x++) {
+      work[ix(Y, x)] += n;
+      n = (n + irand(x, y, 1, m) - videoNoise) >> 1;
+    }
+  }
+
+  // head switching was here
+
+  fromLuma(y); // chroma from luma
+
+  ivec3 vhs = vhsParams();
+
+  // fm
+  if (fm && vhsMode > 0) {
+    Lp f1 = lowpass(float(vhs.x), float(vhs.y), 0.0), f2 = f1, f3 = f1;
+    float carrier = 0.0;
+    float integral = 0.0; // signal integral
+    float last = 0.0; // previous modulated value
+    int ys = int(fmNoiseStart * float(H)), ye = int(fmNoiseStop * float(H));
+    for (int x = 0; x < W; x++) {
+      // integrate, wrapped to 2pi or gpu sin() goes bad
+      integral = mod(integral + map(float(work[ix(Y, x)]), -50000.0, 100000.0, -fmPhase, fmPhase), TAU);
+      float m = sin(carrier + integral); // modulate
+      carrier = mod(carrier + fmOmega, TAU);
+
+      if (fmQuantize > 0) {
+        float q = float(fmQuantize);
+        m = map(float(int(map(m, -1.0, 1.0, 0.0, q))), 0.0, q, -1.0, 1.0);
+      }
+
+      float dem = abs(m - last); // differentiate (first step of demodulation)
+      // fm noise, set demodulation value to maximum
+      if (fmNoise && y > ys && y < ye && frand(x, y, 2) < 0.1) {
+        float s = map(tan(map(float(y), float(ys), float(ye), -PI * 0.5, PI)), -1.0, 1.0, 0.0, 0.2);
+        if (frand(x, y, 3) < s * pnoise(float(x) / 100.0, float(y) / 10.0)) dem = 1.0 + 2.0 * frand(x, y, 4);
+      }
+      last = m;
+
+      float e = low(f3, low(f2, low(f1, dem))); // envelope detection
+      // adjust and map back
+      work[ix(Y, x)] = int(map(2.0 * (e - fmOmega * fmLightness), -fmPhase, fmPhase, -50000.0, 100000.0));
+    }
+  }
+
+  // chroma noise, videoNoise inside is from original, probably typo but left it
+  if (chromaNoise != 0) {
+    int m = chromaNoise * 2 + 1, nu = 0, nv = 0;
+    for (int k = 32; k > 0; k--) {
+      nu = (nu + irand(W - k, y - 1, 5, m) - videoNoise) >> 1;
+      nv = (nv + irand(W - k, y - 1, 6, m) - videoNoise) >> 1;
+    }
+    for (int x = 0; x < W; x++) {
+      work[ix(I, x)] += nu;
+      work[ix(Q, x)] += nv;
+      nu = (nu + irand(x, y, 5, m) - videoNoise) >> 1;
+      nv = (nv + irand(x, y, 6, m) - videoNoise) >> 1;
+    }
+  }
+
+  // chroma phase noise
+  if (chromaPhaseNoise != 0) {
+    int m = chromaPhaseNoise * 2 + 1, n = 0;
+    // noise goes line to line, 24 lines back is enough because of >> 1
+    for (int k = max(0, y - 24); k <= y; k++) n = (n + irand(0, k, 7, m) - chromaPhaseNoise) >> 1;
+    float a = float(n) * PI / 100.0, s = sin(a), c = cos(a);
+    for (int x = 0; x < W; x++) {
+      float u = float(work[ix(I, x)]), v = float(work[ix(Q, x)]);
+      work[ix(I, x)] = int(u * c - v * s);
+      work[ix(Q, x)] = int(u * s + v * c);
+    }
+  }
+
+  if (vhsMode > 0) {
+    // vhs luma lowpass
+    Lp a = lowpass(RATE, float(vhs.x), 16.0), b = a, c = a;
+    Lp pre = lowpass(RATE, float(vhs.x / 3), 16.0);
+    for (int x = 0; x < W; x++) {
+      float s = low(c, low(b, low(a, float(work[ix(Y, x)]))));
+      s += high(pre, s) * 1.6;
+      work[ix(Y, x)] = int(s);
+    }
+    // vhs chroma lowpass
+    for (int ch = I; ch <= Q; ch++) {
+      Lp p = lowpass(RATE, float(vhs.y), 0.0), q = p, r = p;
+      for (int x = 0; x < W; x++) {
+        float s = low(r, low(q, low(p, float(work[ix(ch, x)]))));
+        if (x >= vhs.z) work[ix(ch, x - vhs.z)] = int(s);
+      }
+    }
+  }
+}
+
+// rest of the path, current line only
+void finish(int y) {
+  ivec3 vhs = vhsParams();
+
+  if (vhsMode > 0) {
+    // chroma vert blend
+    if (chromaVertBlend) {
+      for (int x = 0; x < W; x++) {
+        int pu = 0, pv = 0;
+        if (y > 0) {
+          slot = 0;
+          pu = work[ix(I, x)];
+          pv = work[ix(Q, x)];
+          slot = 1;
+        }
+        work[ix(I, x)] = (pu + work[ix(I, x)] + 1) >> 1;
+        work[ix(Q, x)] = (pv + work[ix(Q, x)] + 1) >> 1;
+      }
+    }
+
+    // vhs sharpen
+    if (vhsSharpen) {
+      Lp a = lowpass(RATE, float(vhs.x * 4), 0.0), b = a, c = a;
+      for (int x = 0; x < W; x++) {
+        float s = float(work[ix(Y, x)]);
+        float t = low(c, low(b, low(a, s)));
+        work[ix(Y, x)] = int(s + (s - t) * sharpenAmount * 2.0);
+      }
+    }
+
+    // svideo out
+    if (!svideoOut) {
+      intoLuma(y);
+      fromLuma(y);
+    }
+  }
+
+  // chroma loss
+  if (chromaLoss != 0.0 && pnoise(float(y) / 20.0, 0.0) < chromaLoss) {
+    for (int x = 0; x < W; x++) {
+      work[ix(I, x)] = 0;
+      work[ix(Q, x)] = 0;
+    }
+  }
+
+  // composite recombination
+  for (int n = 0; n < recombine; n++) {
+    intoLuma(y);
+    fromLuma(y);
+  }
+
+  // composite chroma lowpass out
+  if (outChromaLowpass) {
+    if (outChromaLowpassLite) compositeLowpassTv();
+    else compositeLowpass();
+  }
+
+  for (int x = 0; x < W; x++) {
+    // from YIQ
+    float l = float(work[ix(Y, x)]), u = float(work[ix(I, x)]), v = float(work[ix(Q, x)]);
+    ivec3 c = clamp(ivec3(
+      int((l + 0.956 * u + 0.621 * v) / 256.0),
+      int((l - 0.272 * u - 0.647 * v) / 256.0),
+      int((l - 1.106 * u + 1.703 * v) / 256.0)), 0, 255);
+    work[px(x, y)] = c.r << 16 | c.g << 8 | c.b;
+    imageStore(dst, ivec2(x, y), vec4(vec3(c) / 255.0, 1.0));
+  }
+}
+
+/**************
+ * Scanlines
+ **************/
+
+vec3 fetch(int x, int y) {
+  int c = work[px(clamp(x, 0, W - 1), clamp(y, 0, H - 1))];
+  return vec3((c >> 16) & 255, (c >> 8) & 255, c & 255);
+}
+
+// image resized down and back up, like resize() in original, bilinear
+vec3 shrunk(int i, int j, int sw, int sh) {
+  vec2 p = vec2(float(i) * float(W) / float(sw), float(j) * float(H) / float(sh));
+  ivec2 k = ivec2(floor(p));
+  vec2 f = p - vec2(k);
+  return mix(mix(fetch(k.x, k.y), fetch(k.x + 1, k.y), f.x),
+             mix(fetch(k.x, k.y + 1), fetch(k.x + 1, k.y + 1), f.x), f.y);
+}
+
+vec3 blurred(int x, int y) {
+  int sw = max(1, int(float(W) / scanlinesScale)), sh = max(1, int(float(H) / scanlinesScale));
+  vec2 p = vec2(float(x) * float(sw) / float(W), float(y) * float(sh) / float(H));
+  ivec2 k = ivec2(floor(p));
+  vec2 f = p - vec2(k);
+  ivec2 k1 = min(k + 1, ivec2(sw - 1, sh - 1));
+  return floor(mix(mix(shrunk(k.x, k.y, sw, sh), shrunk(k1.x, k.y, sw, sh), f.x),
+                   mix(shrunk(k.x, k1.y, sw, sh), shrunk(k1.x, k1.y, sw, sh), f.x), f.y));
+}
+
+void scanlines(ivec2 p) {
+  vec3 c = floor(blurred(p.x, p.y) / vec3(1.0, 1.8, 10.0)); // layer 1
+
+  // RGB scan lines
+  int band = p.y % 3;
+  vec3 line = vec3(0.0);
+  line[band] = 200.0 + 20.0 * frand(band, p.y - band, 8);
+  c = mix(c, line, 42.0 / 255.0);
+
+  // layer 2, moved one pixel
+  if (p.x > 0) c += floor(blurred(p.x - 1, p.y) / vec3(5.5, 1.8, 1.0));
+
+  imageStore(dst, p, vec4(clamp(c, 0.0, 255.0) / 255.0, 1.0));
+}
+
+void main() {
+  ivec2 size = textureSize(src, 0);
+  W = size.x;
+  H = size.y;
+
+  if (stage == 1) {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < W && p.y < H) scanlines(p);
+    return;
+  }
+
+  row = int(gl_GlobalInvocationID.x);
+  if (row >= H) return;
+
+  if (vhsMode > 0 && chromaVertBlend && row > 0) {
+    slot = 0;
+    signalPath(row - 1);
+  }
+  slot = 1;
+  signalPath(row);
+  finish(row);
+}
